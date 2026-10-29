@@ -406,6 +406,8 @@ const store = {
   customTheme: null,
   lyricMode: 'bubble',
   queue: [],
+  pending: [], // 待解析歌单：按顺序解析好一首、入队一首
+  autoplayPending: false,
   index: -1,
   playing: false,
   position: 0,
@@ -438,6 +440,7 @@ const saveState = (() => {
     lyricMode: store.lyricMode, volume: store.volume, mode: store.mode, radio: store.radio,
     liked: store.liked, index: store.index,
     queue: store.queue.map((t) => ({ backend: t.backend, id: t.id, mid: t.mid, title: t.title, artist: t.artist, album: t.album, cover: t.cover, duration: t.duration })),
+    pending: store.pending.map((t) => ({ backend: t.backend, id: t.id, mid: t.mid, title: t.title, artist: t.artist, album: t.album, cover: t.cover, duration: t.duration })),
   })
   return () => {
     clearTimeout(timer)
@@ -457,9 +460,10 @@ function hydrate() {
       mode: s.mode ?? 'loop', radio: !!s.radio,
       liked: Array.isArray(s.liked) ? s.liked : [],
       queue: Array.isArray(s.queue) ? s.queue : [],
+      pending: Array.isArray(s.pending) ? s.pending : [],
       index: Number.isInteger(s.index) ? s.index : -1,
     })
-    for (const t of store.queue) { t.resolved = null; t.failed = false }
+    for (const t of [...store.queue, ...store.pending]) { t.resolved = null; t.failed = false }
   } catch { /* ignore */ }
 }
 
@@ -666,6 +670,12 @@ function findFences(scope) {
 /* ---------- 围栏 → 悬浮窗（对话里不渲染卡片） ---------- */
 
 let lastApplied = { key: '', at: 0 }
+/** 已被围栏驱动过的 spec 指纹：会话切换导致消息重渲染时，同一份围栏不再打断播放。 */
+const appliedFenceKeys = new Set()
+/** 播放器里是否已经有"活着"的曲目（正在播或已播过一段）。 */
+function musicAlive() {
+  return store.queue.length > 0 && store.index >= 0 && (store.playing || store.position > 3)
+}
 
 /** 搜索并写入 store.results（悬浮窗的「搜索结果」页读数）。 */
 async function searchIntoResults(keyword) {
@@ -695,6 +705,74 @@ async function searchIntoResults(keyword) {
   }
 }
 
+/* ---------- 顺序解析队列：解析好一首入队一首，切歌不再等 ---------- */
+
+let drainToken = 0
+
+/** 接管一份新歌单：清空队列，按顺序逐首解析，就绪一首追加一首。 */
+function setPendingTracks(tracks, { autoplay = false } = {}) {
+  drainToken += 1
+  store.pending = tracks.slice()
+  store.queue = []
+  store.index = -1
+  store.autoplayPending = autoplay
+  store.tab = 'queue'
+  store.panelTab = 'queue'
+  store.emit()
+  void drainPending()
+}
+
+/** 解析进度只在不播放时占用状态栏，别盖掉正在播放的音质提示。 */
+function setPendingStatus() {
+  if (store.playing) return
+  store.status = store.pending.length
+    ? `正在准备队列：还剩 ${store.pending.length} 首…`
+    : `队列就绪，共 ${store.queue.length} 首`
+  store.statusKind = ''
+  store.emit()
+}
+
+/** 串行解析 store.pending：不并发、不抢带宽，队列被换掉即自动停止。 */
+async function drainPending() {
+  const token = ++drainToken
+  setPendingStatus()
+  while (store.pending.length && token === drainToken) {
+    const t = store.pending[0]
+    await resolveTrack(t)
+    if (token !== drainToken) return
+    store.pending.shift()
+    store.queue.push(t)
+    store.emit()
+    saveState()
+    // 第一首就绪就开播，后面继续在后台解析
+    if (store.autoplayPending && store.queue.length === 1) {
+      store.autoplayPending = false
+      void playIndex(0, { auto: true })
+    }
+    setPendingStatus()
+  }
+  if (token !== drainToken) return
+  store.pending = []
+  store.autoplayPending = false
+  setPendingStatus()
+  saveState()
+}
+
+/** 已入队但还没解析的曲目：按顺序在后台预热，轮到它时直链已经就绪。 */
+async function warmQueue(fromIndex = 0) {
+  const token = drainToken
+  for (let i = fromIndex; i < store.queue.length; i++) {
+    if (token !== drainToken) return
+    if (store.pending.length) return // 有新的待解析歌单在跑，让给它
+    const t = store.queue[i]
+    if (!t || t.resolved?.url || t.failed) continue
+    await resolveTrack(t)
+    if (token !== drainToken) return
+    store.emit()
+    saveState()
+  }
+}
+
 /** 把一份围栏 spec 直接喂给悬浮播放器：设置主题/后端，取歌单或搜索并开播。 */
 async function applyFenceSpec(rawSpec) {
   const spec = normalizeSpec(rawSpec)
@@ -710,32 +788,22 @@ async function applyFenceSpec(rawSpec) {
   if (spec.backend) store.backend = spec.backend
 
   if (spec.playlist?.length) {
-    store.queue = spec.playlist.map((item) => ({
-      backend: item.backend ?? store.backend,
-      resolved: null,
-      failed: false,
-      ...item,
-    }))
-    store.index = 0
-    store.tab = 'queue'
-    store.panelTab = 'queue'
-    saveState()
-    store.emit()
-    if (spec.autoplay !== false) void playIndex(0)
-    else if (store.queue[0]) void resolveTrack(store.queue[0])
+    setPendingTracks(
+      spec.playlist.map((item) => ({
+        backend: item.backend ?? store.backend,
+        resolved: null,
+        failed: false,
+        ...item,
+      })),
+      { autoplay: spec.autoplay !== false },
+    )
     return
   }
 
   if (!spec.keyword) return
   const songs = await searchIntoResults(spec.keyword)
   if (!songs.length) return
-  store.queue = songs.slice(0, 10)
-  store.index = 0
-  store.tab = 'queue'
-  store.panelTab = 'queue'
-  store.emit()
-  // 对话里发起的播放请求：默认直接播放搜索到的第一条
-  void playIndex(0)
+  setPendingTracks(songs.slice(0, 10), { autoplay: spec.autoplay !== false })
 }
 
 /**
@@ -751,6 +819,12 @@ function consumeFence(surface, spec) {
   const key = JSON.stringify(spec)
   const now = Date.now()
   if (key === lastApplied.key && now - lastApplied.at < 10000) return
+  // 切会话 / 消息重渲染会把同一份围栏重新渲染一次：此时保持现状，不要打断正在播的歌
+  if (appliedFenceKeys.has(key) && musicAlive()) {
+    store.showDock?.()
+    return
+  }
+  appliedFenceKeys.add(key)
   lastApplied = { key, at: now }
   void applyFenceSpec(spec)
 }
@@ -811,6 +885,12 @@ function takeCodeBlock(block, pre) {
 let historyMode = true
 let historyTimer = null
 let lastHref = ''
+let lastSessionId = ''
+
+/** 当前会话 id：由 sessions 服务注入，拿不到时返回空串。 */
+function currentSessionId() {
+  try { return store.currentSessionId?.() ?? '' } catch { return '' }
+}
 
 function armHistoryMode(ms = 2500) {
   historyMode = true
@@ -830,6 +910,11 @@ function installDomChannel() {
       lastHref = location.href
       armHistoryMode(1500)
     }
+    // DSH Web GUI 切会话不一定改 URL，用会话服务的 current 兜底识别：
+    // 换会话后的一小段时间里历史围栏只隐藏不播放，避免把正在播的歌顶掉
+    const sid = currentSessionId()
+    if (sid && lastSessionId && sid !== lastSessionId) armHistoryMode(3000)
+    if (sid) lastSessionId = sid
     // 1) 旧版宿主：围栏带 language-dsh-music 类名或语言标签文本
     for (const el of findFences(document)) {
       try { take(el) } catch (err) { console.warn('[dsh-music] 围栏挂载失败：', err) }
@@ -1423,10 +1508,17 @@ function apply(ctx) {
   setupAudio()
   createDock()
 
+  // 刷新/重启时：有待入队的曲目就接着按顺序解析；否则把队列里还没解析的曲目预热好
+  if (store.pending.length) void drainPending()
+  else if (store.queue.length) void warmQueue(Math.max(0, store.index + 1))
+
   // sessions 可选注入：有会话服务时启用「AI 推荐」回传通道
   ctx?.inject?.(['sessions'], (scope) => {
     const sessions = scope.get?.('sessions') ?? scope.sessions
     if (!sessions?.list?.getSnapshot || !sessions?.scope) return
+    store.currentSessionId = () => {
+      try { return sessions.list.getSnapshot().current ?? '' } catch { return '' }
+    }
     store.relay = (text) => {
       try {
         const sid = sessions.list.getSnapshot().current
