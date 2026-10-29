@@ -1,0 +1,11 @@
+# dsh-music bundle for DeepSeek Harness (dsh).
+# Inserted into the profile's composition when installed:
+#   dsh plugin --profile web add link:/path/to/dsh-music
+# The plugin row resolves the package by name through the profile's
+# node_modules. The node half (index.js) registers the system-prompt section,
+# the `music` skill, and the /plugins/dsh-music/api routes; the client half
+# (client.js) claims ```dsh-music fences in the conversation DOM and mounts
+# the player card.
+- insert:
+    - id: music
+      name: dsh-music

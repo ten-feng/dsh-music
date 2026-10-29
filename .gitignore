@@ -1,0 +1,7 @@
+node_modules/
+dev/fixtures/
+*.log
+*.bak
+*.bak-*
+.cleanup.mjs
+.DS_Store

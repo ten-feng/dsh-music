@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dsh-music 预览</title>
+<style>
+  body{margin:0;min-height:100vh;background:#0d1117 radial-gradient(1200px 600px at 70% -10%,#1b2740,#0d1117 60%);
+    font-family:system-ui,-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;color:#e6edf3}
+  .wrap{max-width:680px;margin:0 auto;padding:36px 16px 80px}
+  .chat-row{display:flex;flex-direction:column;gap:4px;margin-bottom:18px}
+  .who{font-size:12px;color:#8b949e}
+  .msg{font-size:14px;line-height:1.7}
+  .fake-code{margin:0;padding:12px 14px;background:#161b22;border:1px solid #30363d;border-radius:10px;
+    font:12px/1.6 ui-monospace,Consolas,monospace;color:#a5d6ff;overflow:auto;white-space:pre-wrap}
+  .hint{font-size:12px;color:#8b949e;margin-top:26px;line-height:1.8}
+  code{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:1px 6px;font-size:12px;color:#a5d6ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="chat-row"><span class="who">user</span>
+    <div class="msg">放一首适合深夜听的歌吧</div></div>
+  <div class="chat-row"><span class="who">assistant</span>
+    <div class="msg">深夜就该来点安静的旋律——给你起了一个播放器，歌词做成了悬浮气泡样式：</div></div>
+  <!-- 围栏语言标签由下方脚本注入，模拟宿主 markdown 渲染产物：
+       banner(label) + <pre><code class="language-dsh-music">JSON</code></pre> -->
+  <div id="fence-host"></div>
+  <div class="hint">
+    预览说明：?spec=glass|neon|paper|vapor 切换主题；q 带 <code>demo </code> 前缀走本地 fixtures，
+    其余走真实网易云/QQ 接口（失败自动兜底）。点击卡片任意位置可看到气泡迸发特效。
+  </div>
+</div>
+<script>
+  const params = new URLSearchParams(location.search)
+  if (params.has('fresh')) { try { localStorage.removeItem('dsh-music.state.v1') } catch {} }
+  const specName = params.get('spec') ?? 'glass'
+  const specs = {
+    glass: { theme: 'glass', backend: 'netease', keyword: 'demo 深夜', autoplay: false, lyricMode: 'bubble', title: '深夜电台' },
+    neon: { theme: 'neon', backend: 'netease', keyword: 'demo 电子夜跑', autoplay: false, lyricMode: 'bar', title: '霓虹夜跑' },
+    paper: { theme: 'paper', backend: 'netease', keyword: 'demo 下午茶', autoplay: false, lyricMode: 'none', title: '纸间漫步' },
+    vapor: { theme: 'vapor', backend: 'netease', keyword: 'demo 蒸汽波', autoplay: false, lyricMode: 'bubble', title: '蒸汽波咖啡' },
+    custom: { theme: { accent: '#f9a8d4', bg: '#3b0764', text: '#fdf4ff', bubbles: true, coverBlur: true, radius: 28 }, backend: 'netease', keyword: 'demo 梦境', autoplay: false, lyricMode: 'bubble', title: '自定义主题' },
+  }
+  const body = JSON.stringify(specs[specName] ?? specs.glass)
+  // 模拟新版宿主对 ```dsh-music 围栏的渲染：.md-code-block > pre > code
+  // 新版客户端按内容识别围栏，且启动后的 2.5s 属于「历史模式」不触发播放，
+  // 因此延迟注入，等历史模式结束后再让围栏生效（预览才能自动起播）。
+  setTimeout(() => {
+    const surface = document.createElement('div')
+    surface.className = 'md-code-block'
+    const pre = document.createElement('pre')
+    const code = document.createElement('code')
+    code.className = 'language-dsh-music'
+    code.textContent = body
+    pre.appendChild(code)
+    surface.appendChild(pre)
+    document.getElementById('fence-host').appendChild(surface)
+  }, 2800)
+</script>
+<script>
+  // 与 DSH Web 客户端一致的模块装载器桩：本地预览没有宿主模块表，
+  // 只有设置页的「账号」区块需要 react，预览里不渲染它。
+  window.__ModuleLoader__ = {
+    entries: [],
+    load(entry) { this.entries.push(entry) },
+    create() {},
+  }
+  window.require = () => ({ createElement: () => ({}), useState: () => [null, () => {}], useEffect() {}, useCallback: (f) => f, useRef: () => ({}) })
+</script>
+<script src="./client.js"></script>
+<script>
+  const entry = window.__ModuleLoader__.entries.find((x) => x.id === 'dsh-music')
+  const mod = entry.factory(window.require)
+  mod.apply({ inject() {} })
+</script>
+</body>
+</html>
