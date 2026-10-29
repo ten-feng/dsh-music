@@ -31,14 +31,23 @@
 ## 安装
 
 ```bash
-# 本地开发（链接安装）
-dsh plugin --profile web add link:/path/to/dsh-music
+# 从 GitHub 公开库安装（tarball，不需要 git；profile 按你的环境换成 desktop / web）
+dsh plugin --profile desktop add https://codeload.github.com/ten-feng/dsh-music/tar.gz/refs/heads/main
 
-# 已发布到 npm 后
-dsh plugin --profile web add dsh-music
+# 已把源码 clone 到本地时
+dsh plugin --profile desktop add link:/path/to/dsh-music
 ```
 
-装完重启 DSH web 界面即可。零运行时依赖，Node ≥ 20。
+DSH 桌面版没有暴露 `dsh` 命令时，可直接用 pnpm 写入同一个 profile：
+
+```bash
+pnpm add https://codeload.github.com/ten-feng/dsh-music/tar.gz/refs/heads/main --dir "%USERPROFILE%\.dsh\profiles\desktop"
+```
+
+装完重启 DSH 即可。零运行时依赖，Node ≥ 20。
+
+> 依赖指向 `refs/heads/main`，`pnpm install` 会跟随最新 main；需要固定版本时把 URL 换成某个 tag，例如
+> `https://codeload.github.com/ten-feng/dsh-music/tar.gz/refs/tags/v0.2.11`。
 
 > 客户端半区必须走 DSH 的 `window.__ModuleLoader__.load({ id, factory })` 工厂格式
 > （与官方客户端插件一致）；直接 `export` 的 ESM 版本不会被宿主加载。
