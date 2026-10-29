@@ -309,7 +309,8 @@ function parseTranslation(lrc) {
 /* ================= API ================= */
 
 async function api(path, opts) {
-  const res = await fetch(`${API_BASE}/${path}`, opts)
+  // 宿主解析偶尔会长时间不返回，加超时避免播放器永远停在「正在解析…」
+  const res = await fetch(`${API_BASE}/${path}`, { signal: AbortSignal.timeout(60000), ...opts })
   let body = null
   try { body = await res.json() } catch { /* ignore */ }
   if (!res.ok || (body && body.error)) throw new Error(body?.error ?? `HTTP ${res.status}`)
@@ -318,6 +319,63 @@ async function api(path, opts) {
 const apiSearch = (backend, q, limit = 12) => api(`search?backend=${encodeURIComponent(backend)}&q=${encodeURIComponent(q)}&limit=${limit}`)
 const apiSong = (track) => api('song', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ track }) })
 const apiLyric = (track) => api('lyric', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ track }) })
+
+/** 解析播放直链并缓存到曲目上（此前只被调用、从未定义，导致起播必抛 ReferenceError）。 */
+async function resolveTrack(t) {
+  if (!t) return { resolved: null, failed: true }
+  if (t.resolved?.url) return { resolved: t.resolved, failed: false }
+  try {
+    const data = await apiSong({
+      backend: t.backend,
+      id: t.id,
+      mid: t.mid,
+      title: t.title,
+      artist: t.artist,
+      album: t.album,
+      cover: t.cover,
+      duration: t.duration,
+      metingTrack: t.metingTrack,
+    })
+    const song = data?.song ?? null
+    if (!song || !song.url) {
+      t.failed = true
+      t.resolved = null
+      t.error = song?.reason === 'ALL_TIERS_FAILED' ? '四档音源都没拿到直链' : '没有可播放的音源'
+      return { resolved: null, failed: true }
+    }
+    if (t.backend && song.backend && song.backend !== t.backend) t.fellBack = true
+    if (song.backend) t.backend = song.backend
+    if (song.metingTrack) t.metingTrack = song.metingTrack
+    t.resolved = song
+    t.failed = false
+    t.error = ''
+    return { resolved: song, failed: false }
+  } catch (e) {
+    t.failed = true
+    t.error = e instanceof Error ? e.message : String(e)
+    return { resolved: null, failed: true }
+  }
+}
+
+/** 拉歌词；失败只让歌词面板留空，不影响播放。 */
+async function loadLyric(t) {
+  store.lines = []
+  store.trans = []
+  store.emit()
+  try {
+    const data = await apiLyric({
+      backend: t.backend,
+      id: t.id,
+      mid: t.mid,
+      title: t.title,
+      artist: t.artist,
+      metingTrack: t.metingTrack,
+    })
+    store.lines = parseLrc(data?.lrc ?? '')
+    store.trans = parseTranslation(data?.tlrc ?? '')
+  } catch { /* 歌词失败忽略 */ }
+  store.emit()
+}
 
 function pickBest(songs, want) {
   const norm = (s) => String(s ?? '').toLowerCase().replace(/\s+/g, '')
