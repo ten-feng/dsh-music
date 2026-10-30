@@ -346,6 +346,13 @@ async function resolveTrack(t) {
     if (t.backend && song.backend && song.backend !== t.backend) t.fellBack = true
     if (song.backend) t.backend = song.backend
     if (song.metingTrack) t.metingTrack = song.metingTrack
+    // 搜索接口常常不带封面（album.picUrl 为空），只有详情接口才有。
+    // 解析成功就把详情里的元数据补回曲目，否则这首曲目会一直显示空封面。
+    if (song.cover && song.cover !== t.cover) t.cover = song.cover
+    if (!t.title && song.title) t.title = song.title
+    if (!t.artist && song.artist) t.artist = song.artist
+    if (!t.album && song.album) t.album = song.album
+    if (!t.duration && song.duration) t.duration = song.duration
     t.resolved = song
     t.failed = false
     t.error = ''
@@ -1070,13 +1077,56 @@ function createDock() {
       el.style.bottom = 'auto'
     }
   }
+  /* 顶部禁区：DSH 页眉是 Electron 的窗口拖拽区（-webkit-app-region: drag）。
+     播放器一旦停进那块区域，指针事件会被窗口拖拽吞掉，就再也抓不住了
+     （表现为「拖动播放器变成拖动整个 DSH 窗口」）。所以把可停靠范围限制在页眉下方。 */
+  const isDragRegion = (node) => {
+    for (let n = node; n; n = n.parentElement) {
+      let v = ''
+      try {
+        const cs = getComputedStyle(n)
+        v = cs.webkitAppRegion || cs.getPropertyValue('-webkit-app-region') || ''
+      } catch { /* ignore */ }
+      if (v) return String(v).trim() === 'drag'
+    }
+    return false
+  }
+  // 从页面顶部往下扫出拖拽区底边；扫不到时桌面端退回保守高度，浏览器端不限制
+  const headerGuardHeight = () => {
+    let bottom = 0
+    try {
+      const x = Math.round((window.innerWidth || 0) / 2)
+      if (x > 0 && typeof document.elementFromPoint === 'function') {
+        for (let y = 0; y <= 140; y += 2) {
+          const hit = document.elementFromPoint(x, y)
+          if (hit && isDragRegion(hit)) bottom = y + 2
+          else if (bottom) break
+        }
+      }
+    } catch { bottom = 0 }
+    if (bottom) return bottom + 6
+    // 兜底：量一下顶部贴边的固定/粘性页眉（个别版本读不到 -webkit-app-region）
+    let fallback = 0
+    try {
+      const vw = window.innerWidth || 0
+      const nodes = document.querySelectorAll('header,[role="banner"],[class*="titlebar"],[class*="Titlebar"],[class*="topbar"],[class*="header"],[class*="Header"]')
+      for (const el of nodes) {
+        const r = el.getBoundingClientRect()
+        if (r.top <= 1 && r.height >= 16 && r.height <= 140 && r.width >= vw * 0.5) fallback = Math.max(fallback, r.bottom)
+      }
+    } catch { fallback = 0 }
+    if (fallback) return fallback + 6
+    return isDesktopApp() ? 56 : 0
+  }
+  let topGuard = headerGuardHeight()
   const clampPos = (x, y, el) => {
     const rect = el.getBoundingClientRect()
     const w = rect.width || 320
     const h = rect.height || 120
+    const minY = Math.max(8, topGuard)
     return {
       x: clamp(x, 8, Math.max(8, window.innerWidth - w - 8)),
-      y: clamp(y, 8, Math.max(8, window.innerHeight - h - 8)),
+      y: clamp(y, minY, Math.max(minY, window.innerHeight - h - 8)),
     }
   }
 
@@ -1086,6 +1136,7 @@ function createDock() {
     if (inPip) return
     if (event.button !== undefined && event.button !== 0) return
     if (event.target.closest?.('button') || event.target.closest?.('input')) return
+    topGuard = headerGuardHeight()
     const rect = el.getBoundingClientRect()
     drag = { el, dx: event.clientX - rect.left, dy: event.clientY - rect.top, sx: event.clientX, sy: event.clientY, moved: false }
     // 不在这里 preventDefault：否则可能连带吞掉点击（点歌名要能展开）
@@ -1124,10 +1175,13 @@ function createDock() {
   window.addEventListener('pointerup', onUp)
   window.addEventListener('pointercancel', onUp)
   window.addEventListener('resize', () => {
+    topGuard = headerGuardHeight()
     if (!pos) return
     pos = clampPos(pos.x, pos.y, full.hidden ? dock : full)
     place()
   })
+  // 恢复上次位置时也要过一遍禁区夹取，否则历史位置在页眉里会一直卡住
+  if (pos) pos = clampPos(pos.x, pos.y, full)
   place()
 
   let dismissed = false
