@@ -78,6 +78,7 @@ const I = {
   note: icon('<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>'),
   popout: icon('<path d="M14 4h6v6"/><path d="M20 4l-7 7"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>'),
   embed: icon('<path d="M10 20H4v-6"/><path d="M4 20l7-7"/><path d="M20 10V4h-6"/>'),
+  trash: icon('<path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/><path d="M9 7V4h6v3"/>'),
 }
 
 const DOCK_CSS = `
@@ -256,6 +257,9 @@ const DOCK_CSS = `
   align-items:center;justify-content:center;opacity:0;transition:opacity .15s,color .15s}
 .dshmf-row:hover .play,.dshmf-row.act .play{opacity:.9}
 .dshmf-row:hover .play{color:#fff}
+.dshmf-row.bad{opacity:.62}
+.dshmf-row.bad .tt{text-decoration:line-through;color:rgba(255,150,150,.9)}
+.dshmf-row.bad .src{color:#ff9a9a;border-color:rgba(255,120,120,.4)}
 .dshmf-row .play svg{width:11px;height:11px}
 .dshmd-row{cursor:grab;touch-action:none}
 .dshmd-row:active{cursor:grabbing}
@@ -1030,8 +1034,11 @@ function createDock() {
   fClose.title = '关闭播放器'
   fClose.setAttribute('aria-label', '关闭')
   const fHead = h('div', 'dshmf-head', '<span class="dshmf-head-label"><i class="dshmf-live"></i>正在播放</span>')
+  const fClean = h('button', 'dshmf-icon-btn', I.trash)
+  fClean.title = '清理不可播曲目'
+  fClean.setAttribute('aria-label', '清理不可播曲目')
   const fHeadActs = h('div', 'dshmf-head-acts')
-  fHeadActs.append(fCollapse, fClose)
+  fHeadActs.append(fClean, fCollapse, fClose)
   fHead.appendChild(fHeadActs)
 
   /* 列表：播放队列 / 搜索结果 */
@@ -1368,7 +1375,7 @@ function createDock() {
     fTabResults.textContent = `搜索结果${store.results.length ? ` ${store.results.length}` : ''}`
     fTabQueue.classList.toggle('on', tab === 'queue')
     fTabResults.classList.toggle('on', tab === 'results')
-    const sig = `${tab}|${items.length}|${store.index}|${store.playing}`
+    const sig = `${tab}|${items.length}|${store.index}|${store.playing}|${items.filter((x) => x.failed).length}`
     if (sig === listSig) return
     listSig = sig
     const rows = items.map((item, i) => {
@@ -1391,7 +1398,9 @@ function createDock() {
       const ar = h('div', 'ar')
       ar.textContent = [item.artist, item.album].filter(Boolean).join(' · ')
       meta.append(tt, ar)
-      const src = h('span', 'src', BACKEND_LABEL[item.backend] ?? '')
+      const bad = Boolean(item.failed)
+      if (bad && tab === 'queue') row.classList.add('bad')
+      const src = h('span', 'src', bad ? '不可播' : (BACKEND_LABEL[item.backend] ?? ''))
       const play = h('span', 'play', I.play)
       row.append(no, cov, meta, src, play)
       row.addEventListener('click', () => {
@@ -1409,6 +1418,42 @@ function createDock() {
     const activeRow = fList.querySelector?.('.dshmf-row.act')
     activeRow?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
   }
+
+  /* 清理不可播：把四档音源都拿不到直链的曲目移出队列，保留正在播放的那首 */
+  const cleanUnplayable = () => {
+    const bad = store.queue.filter((t) => t.failed)
+    if (!bad.length) {
+      store.status = '队列里没有不可播的曲目'
+      store.statusKind = ''
+      store.emit()
+      return
+    }
+    const cur = store.track
+    const keepCur = Boolean(cur && !cur.failed)
+    store.queue = store.queue.filter((t) => !t.failed)
+    if (!store.queue.length) {
+      store.index = -1
+      store.position = 0
+      store.duration = 0
+      store.playing = false
+      store.lines = []
+      store.trans = []
+      try { audio.pause(); audio.removeAttribute('src') } catch { /* ignore */ }
+      store.status = `已清理 ${bad.length} 首不可播曲目，队列已空`
+    } else {
+      store.index = keepCur
+        ? Math.max(0, store.queue.indexOf(cur))
+        : Math.min(Math.max(0, store.index), store.queue.length - 1)
+      store.status = `已清理 ${bad.length} 首不可播曲目`
+    }
+    store.statusKind = ''
+    store.failStreak = 0
+    listSig = ''
+    saveState()
+    store.emit()
+    if (!keepCur && store.queue.length) void playIndex(store.index)
+  }
+  fClean.addEventListener('click', cleanUnplayable)
 
   /* 歌词面板：打开后顶替封面位置 */
   let lyricSig = ''
@@ -1475,6 +1520,9 @@ function createDock() {
     if (!t) {
       dock.hidden = true
       full.hidden = true
+      // 队列被清空时把列表也抹掉，避免下次展开看到已删除的残留行
+      listSig = ''
+      fList.replaceChildren()
       return
     }
     show()
