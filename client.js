@@ -450,10 +450,18 @@ const saveState = (() => {
     backend: store.backend, theme: store.theme, customTheme: store.customTheme,
     lyricMode: store.lyricMode, volume: store.volume, mode: store.mode, radio: store.radio,
     liked: store.liked, index: store.index,
+    // 本地补丁（2026-10-31）：会话视图共享同一份快照 —— 队列、当前曲、谁在出声
+    ownerId,
+    playing: typeof audio !== 'undefined' ? (!audio.paused && !!audio.src) : false,
+    position: typeof audio !== 'undefined' && Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+    appliedKeys: Array.from(sharedAppliedKeys).slice(-80),
+    updatedAt: Date.now(),
     queue: store.queue.map((t) => ({ backend: t.backend, id: t.id, mid: t.mid, title: t.title, artist: t.artist, album: t.album, cover: t.cover, duration: t.duration })),
     pending: store.pending.map((t) => ({ backend: t.backend, id: t.id, mid: t.mid, title: t.title, artist: t.artist, album: t.album, cover: t.cover, duration: t.duration })),
   })
   return () => {
+    // 镜像态（别的会话持有播放）不写快照，避免把对方的队列覆盖成自己的旧状态
+    if (ownerId && ownerId !== INSTANCE_ID) return
     clearTimeout(timer)
     timer = setTimeout(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(snapshot())) } catch { /* ignore */ } }, 400)
   }
@@ -475,6 +483,91 @@ function hydrate() {
       index: Number.isInteger(s.index) ? s.index : -1,
     })
     for (const t of [...store.queue, ...store.pending]) { t.resolved = null; t.failed = false }
+  } catch { /* ignore */ }
+}
+
+/* ================= 跨会话视图共享同一份播放器状态（本地补丁 2026-10-31） ================= */
+/*
+ * DSH 桌面版把每个会话放在独立的 WebContentsView（独立文档）里，于是每个会话都有一份
+ * dsh-music 实例、各自的 store 与 <audio>。目标：所有会话共享同一份队列，同一时间只有
+ * 一个实例出声。做法：把共享状态写进同一个 localStorage 键（STORE_KEY），靠 storage
+ * 事件在实例间同步；谁在放，谁就是 owner，其他实例只镜像列表、不发声。
+ */
+const INSTANCE_ID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+let ownerId = ''              // '' = 无人持有；INSTANCE_ID = 本实例；其他 = 别的会话在放
+let remotePausing = false     // 被别的会话抢占导致的暂停，不要回写状态
+const sharedAppliedKeys = new Set()
+let lastAdoptedRaw = ''       // 最近一次采纳过的快照原文，避免重复处理
+
+function adoptShared(raw) {
+  // 同一条快照只处理一次：切会话 / 重复事件不产生多余的重渲染
+  if (raw === lastAdoptedRaw) return
+  lastAdoptedRaw = raw
+  let s
+  try { s = JSON.parse(raw) } catch { return }
+  if (!s || typeof s !== 'object') return
+  if (Array.isArray(s.appliedKeys)) for (const k of s.appliedKeys) sharedAppliedKeys.add(k)
+
+  const otherOwner = !!s.ownerId && s.ownerId !== INSTANCE_ID
+  if (otherOwner) {
+    // 别的会话在放：本实例立刻静音（避免多路同时出声），但保留它的列表用于展示
+    if (!audio.paused) {
+      remotePausing = true
+      try { audio.pause() } catch { /* ignore */ }
+      remotePausing = false
+    }
+    ownerId = s.ownerId
+    // 本实例手里的 <audio> 指向的是自己的旧曲目，清掉避免按播放时放出旧歌
+    if (audio.src) { try { audio.removeAttribute('src'); audio.load() } catch { /* ignore */ } }
+    const changed = Array.isArray(s.queue) && (
+      s.queue.length !== store.queue.length ||
+      s.queue.some((t, i) => t.title !== store.queue[i]?.title || t.artist !== store.queue[i]?.artist)
+    )
+    if (Array.isArray(s.queue)) {
+      store.queue = s.queue.map((t) => ({ ...t, resolved: null, failed: false }))
+    }
+    if (Array.isArray(s.pending)) store.pending = s.pending.map((t) => ({ ...t, resolved: null, failed: false }))
+    if (Number.isInteger(s.index)) store.index = s.index
+    if (typeof s.backend === 'string') store.backend = s.backend
+    if (typeof s.theme === 'string') store.theme = s.theme
+    if (typeof s.mode === 'string') store.mode = s.mode
+    if (Number.isFinite(s.volume)) store.volume = clamp(s.volume, 0, 1)
+    if (!store.playing && Number.isFinite(s.position)) store.position = s.position
+    drainToken += 1 // 停掉本实例正在跑的队列解析，避免两边抢
+    store.pending = []
+    store.emit()
+    if (changed && store.queue.length) store.showDock?.()
+    return
+  }
+
+  // 无人持有（对方暂停 / 关闭）：仍然采纳共享列表，保证每个会话看到的是同一份队列
+  ownerId = ''
+  if (Array.isArray(s.queue) && s.queue.length) {
+    const sameQueue = s.queue.length === store.queue.length &&
+      s.queue.every((t, i) => t.title === store.queue[i]?.title && t.artist === store.queue[i]?.artist)
+    if (!sameQueue) {
+      store.queue = s.queue.map((t) => ({ ...t, resolved: null, failed: false }))
+      if (Number.isInteger(s.index)) store.index = s.index
+      store.emit()
+      store.showDock?.()
+    }
+  }
+}
+
+function installSharedSync() {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== STORE_KEY || !event.newValue) return
+    try { adoptShared(event.newValue) } catch (err) { console.warn('[dsh-music] 共享状态同步失败：', err) }
+  })
+  // 首次挂载就把别处的列表接过来（切到没播过的会话也能看到同一份歌单）
+  syncFromStorage()
+}
+
+/** 主动读一次共享快照（切会话时也调用，保证列表立刻对齐）。 */
+function syncFromStorage() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY)
+    if (raw) adoptShared(raw)
   } catch { /* ignore */ }
 }
 
@@ -516,6 +609,7 @@ async function playIndex(i, { auto = false } = {}) {
   store.position = 0
   store.duration = t.duration ? t.duration / 1000 : 0
   store.emit()
+  saveState() // 切歌同步给其他会话视图
   const resolved = await resolveTrack(t)
   if (resolved.failed) {
     audio.pause()
@@ -593,8 +687,17 @@ function prev() {
 
 function setupAudio() {
   audio.volume = 1
-  audio.addEventListener('play', () => { store.playing = true; store.emit() })
-  audio.addEventListener('pause', () => { store.playing = false; store.emit() })
+  audio.addEventListener('play', () => {
+    store.playing = true
+    // 本地补丁：谁在出声，谁就持有共享播放权，别的会话收到后自动静音
+    if (!remotePausing) { ownerId = INSTANCE_ID; saveState() }
+    store.emit()
+  })
+  audio.addEventListener('pause', () => {
+    store.playing = false
+    if (!remotePausing && ownerId === INSTANCE_ID) { ownerId = ''; saveState() }
+    store.emit()
+  })
   audio.addEventListener('timeupdate', () => {
     store.position = audio.currentTime
     if (Number.isFinite(audio.duration) && audio.duration > 0) store.duration = audio.duration
@@ -625,6 +728,7 @@ function setupAudio() {
 function normalizeSpec(raw) {
   const spec = raw && typeof raw === 'object' ? raw : {}
   const out = {}
+  out.resume = spec.resume === true
   out.theme = spec.theme
   out.backend = spec.backend === 'qq' ? 'qq' : spec.backend === 'netease' ? 'netease' : null
   out.keyword = typeof spec.keyword === 'string' ? spec.keyword.trim() : ''
@@ -681,8 +785,6 @@ function findFences(scope) {
 /* ---------- 围栏 → 悬浮窗（对话里不渲染卡片） ---------- */
 
 let lastApplied = { key: '', at: 0 }
-/** 已被围栏驱动过的 spec 指纹：会话切换导致消息重渲染时，同一份围栏不再打断播放。 */
-const appliedFenceKeys = new Set()
 /** 播放器里是否已经有"活着"的曲目（正在播或已播过一段）。 */
 function musicAlive() {
   return store.queue.length > 0 && store.index >= 0 && (store.playing || store.position > 3)
@@ -798,6 +900,22 @@ async function applyFenceSpec(rawSpec) {
   if (spec.lyricMode) store.lyricMode = spec.lyricMode
   if (spec.backend) store.backend = spec.backend
 
+  // 本地补丁：`{"resume":true}` —— 不换列表，从当前曲目/进度继续播放
+  if (spec.resume === true) {
+    if (!store.track) return
+    if (!audio.paused) return
+    if (audio.src) {
+      const pos = Number.isFinite(store.position) ? store.position : 0
+      if (pos > 1 && Math.abs(audio.currentTime - pos) > 2) {
+        try { audio.currentTime = pos } catch { /* ignore */ }
+      }
+      void audio.play().catch(() => {})
+    } else {
+      void playIndex(store.index, { auto: true })
+    }
+    return
+  }
+
   if (spec.playlist?.length) {
     setPendingTracks(
       spec.playlist.map((item) => ({
@@ -826,17 +944,21 @@ function consumeFence(surface, spec) {
   if (!surface || surface.dataset.dshmMounted === 'done') return
   surface.dataset.dshmMounted = 'done'
   surface.style.display = 'none'
-  if (historyMode) return
   const key = JSON.stringify(spec)
+  const known = knownFenceKeys.has(key) || sharedAppliedKeys.has(key)
+  knownFenceKeys.add(key)
+  // 已知围栏（切会话重渲染 / 别的会话里的老卡片）：直接忽略，不重播也不更新界面
+  if (known) return
+  // 进入会话后最初渲染出来的围栏属于历史消息：登记但不起播
+  if (historyMode || Date.now() < freshUntil) return
   const now = Date.now()
   if (key === lastApplied.key && now - lastApplied.at < 10000) return
-  // 切会话 / 消息重渲染会把同一份围栏重新渲染一次：此时保持现状，不要打断正在播的歌
-  if (appliedFenceKeys.has(key) && musicAlive()) {
-    store.showDock?.()
-    return
-  }
-  appliedFenceKeys.add(key)
   lastApplied = { key, at: now }
+  // 本地补丁：点歌即接管共享播放权，登记的指纹同步给其他会话
+  sharedAppliedKeys.add(key)
+  knownFenceKeys.add(key)
+  ownerId = INSTANCE_ID
+  saveState()
   void applyFenceSpec(spec)
 }
 
@@ -857,13 +979,14 @@ function take(codeEl) {
 
 // 只允许 dsh-music 围栏 schema 里的键；出现任何陌生键就不认，
 // 避免把用户要的普通 JSON 示例抢过来渲染成播放器。
-const SPEC_KEYS = new Set(['theme', 'backend', 'keyword', 'playlist', 'autoplay', 'lyricMode', 'title'])
+const SPEC_KEYS = new Set(['theme', 'backend', 'keyword', 'playlist', 'autoplay', 'lyricMode', 'title', 'resume', 'nonce'])
 
 function isMusicSpec(spec) {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return false
   const keys = Object.keys(spec)
   if (keys.length === 0) return false
   if (keys.some((key) => !SPEC_KEYS.has(key))) return false
+  if (spec.resume === true) return true
   const hasKeyword = typeof spec.keyword === 'string' && spec.keyword.trim().length > 0
   const hasPlaylist = Array.isArray(spec.playlist) && spec.playlist.length > 0
   return hasKeyword || hasPlaylist
@@ -909,6 +1032,19 @@ function armHistoryMode(ms = 2500) {
   historyTimer = setTimeout(() => { historyMode = false }, ms)
 }
 
+/**
+ * 围栏全局共享（本地补丁 2026-10-31）：所有会话共用一份播放器、一份围栏登记表。
+ * 任何会话里出现过的围栏都会记进 knownFenceKeys，同一份围栏只驱动播放器一次；
+ * 切会话时看到的旧围栏都已是「已知项」，只隐藏、不重播、不替换正在放的队列。
+ * 某个会话里新发出的点歌围栏（第一次出现、且不在进入会话后的历史窗口内）照常接管。
+ */
+const knownFenceKeys = new Set()
+let freshUntil = 0
+
+function armFreshWindow(ms = 4000) {
+  freshUntil = Date.now() + ms
+}
+
 function installDomChannel() {
   armHistoryMode(2500)
   lastHref = location.href
@@ -924,7 +1060,12 @@ function installDomChannel() {
     // DSH Web GUI 切会话不一定改 URL，用会话服务的 current 兜底识别：
     // 换会话后的一小段时间里历史围栏只隐藏不播放，避免把正在播的歌顶掉
     const sid = currentSessionId()
-    if (sid && lastSessionId && sid !== lastSessionId) armHistoryMode(3000)
+    if (sid && lastSessionId && sid !== lastSessionId) {
+      armHistoryMode(3000)
+      // 本地补丁：进入新会话后的一小段时间里渲染出的围栏属于历史消息，只登记不起播
+      armFreshWindow(4000)
+    }
+    if (sid && !lastSessionId) armFreshWindow(4000)
     if (sid) lastSessionId = sid
     // 1) 旧版宿主：围栏带 language-dsh-music 类名或语言标签文本
     for (const el of findFences(document)) {
@@ -1609,6 +1750,9 @@ function apply(ctx) {
   document.body.appendChild(audio)
   setupAudio()
   createDock()
+  installSharedSync()
+  // 本地补丁：别的会话点过歌，这个会话一进来就该看到同一份列表
+  if (store.queue.length) { store.showDock?.(); store.emit() }
 
   // 刷新/重启时：有待入队的曲目就接着按顺序解析；否则把队列里还没解析的曲目预热好
   if (store.pending.length) void drainPending()
