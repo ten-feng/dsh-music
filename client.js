@@ -1449,19 +1449,72 @@ function createDock() {
     fCollapse.title = '收起'
     fCollapse.setAttribute('aria-label', '收起')
     try { if (win.document.body.contains(full)) win.document.body.removeChild(full) } catch { /* ignore */ }
+    if (floatRestoreCollapsed) {
+      full.hidden = true
+      dock.hidden = false
+      floatRestoreCollapsed = false
+    }
     place()
     sync()
   }
+  /**
+   * 独立小窗的文档不一定已经长好（Document PiP 新窗口、window.open 刚写入骨架），
+   * 取 body/head 之前先补一个最小骨架，避免 appendChild 抛异常后只留下一片空白窗口。
+   */
+  const ensureFloatDoc = (doc) => {
+    if (!doc) return false
+    if (!doc.body || !doc.documentElement) {
+      try {
+        doc.open()
+        doc.write('<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>')
+        doc.close()
+      } catch { /* ignore */ }
+    }
+    return !!doc.body
+  }
+  /** 从迷你条拖出时 full 还是隐藏的，收回主界面时要还原成收起状态 */
+  let floatRestoreCollapsed = false
   const attachFloat = (win) => {
+    let doc
+    try {
+      doc = win.document
+    } catch (err) {
+      try { win.close() } catch { /* ignore */ }
+      flashTip('独立小窗不可用：无法访问窗口文档')
+      console.warn('[dsh-music] 独立小窗无法访问 document：', err)
+      return
+    }
+    if (!ensureFloatDoc(doc)) {
+      try { win.close() } catch { /* ignore */ }
+      flashTip('独立小窗不可用：窗口文档未就绪')
+      console.warn('[dsh-music] 独立小窗文档没有 body')
+      return
+    }
+    // 关键：从迷你条（dock）拖到边缘时 full 仍是 hidden，直接搬进小窗就是一片空白。
+    // 先展开再搬，窗口里才有内容。
+    floatRestoreCollapsed = full.hidden
+    dock.hidden = true
+    full.hidden = false
     floatWin = win
     inPip = true
-    const doc = win.document
-    doc.documentElement.style.background = 'transparent'
-    doc.body.style.cssText = 'margin:0;background:transparent;overflow:hidden'
-    const st = doc.createElement('style')
-    st.textContent = DOCK_CSS
-    doc.head.appendChild(st)
-    doc.body.appendChild(full)
+    try {
+      doc.documentElement.style.background = 'transparent'
+      doc.body.style.cssText = 'margin:0;background:transparent;overflow:hidden'
+      const st = doc.createElement('style')
+      st.textContent = DOCK_CSS
+      ;(doc.head || doc.documentElement).appendChild(st)
+      doc.body.appendChild(full)
+    } catch (err) {
+      // 搬移失败就把面板退回主界面，别把窗口留成白板
+      floatWin = null
+      inPip = false
+      try { document.body.appendChild(full) } catch { /* ignore */ }
+      full.classList.remove('dshmf-in-pip')
+      try { win.close() } catch { /* ignore */ }
+      flashTip('独立小窗不可用：面板搬移失败')
+      console.warn('[dsh-music] 独立小窗搬移失败：', err)
+      return
+    }
     full.classList.add('dshmf-in-pip')
     // 头部按钮变成「收回主界面」
     fCollapse.innerHTML = I.embed
