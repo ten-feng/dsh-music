@@ -8,4 +8,4 @@
 # the player card.
 - insert:
     - id: music
-      name: dsh-music
+      name: dsh-music-plugin
