@@ -38,6 +38,8 @@ const inject = ['slots', 'locale']
 const FENCE_LANG = 'dsh-music'
 const API_BASE = '/plugins/dsh-music/api'
 const STORE_KEY = 'dsh-music.state.v1'
+/** 宿主代理 token 的有效期是 10 分钟，缓存的直链留 8 分钟余量后强制重解析。 */
+const RESOLVE_TTL_MS = 8 * 60 * 1000
 
 const THEMES = ['glass', 'neon', 'paper', 'vapor']
 const BACKEND_LABEL = { netease: '网易云', qq: 'QQ 音乐', meting: 'Meting' }
@@ -327,7 +329,14 @@ const apiLyric = (track) => api('lyric', { method: 'POST', headers: { 'content-t
 /** 解析播放直链并缓存到曲目上（此前只被调用、从未定义，导致起播必抛 ReferenceError）。 */
 async function resolveTrack(t) {
   if (!t) return { resolved: null, failed: true }
-  if (t.resolved?.url) return { resolved: t.resolved, failed: false }
+  // 代理 token 10 分钟过期（src/media/proxy.mjs 的 TOKEN_TTL_MS）：
+  // 缓存的直链超过安全期就丢掉重解析，否则循环到第二轮会全是失效链接。
+  if (t.resolved?.url) {
+    if (!t.resolvedAt || Date.now() - t.resolvedAt < RESOLVE_TTL_MS) {
+      return { resolved: t.resolved, failed: false }
+    }
+    t.resolved = null
+  }
   try {
     const data = await apiSong({
       backend: t.backend,
@@ -358,6 +367,8 @@ async function resolveTrack(t) {
     if (!t.album && song.album) t.album = song.album
     if (!t.duration && song.duration) t.duration = song.duration
     t.resolved = song
+    t.resolvedAt = Date.now()
+    t.retried = false
     t.failed = false
     t.error = ''
     return { resolved: song, failed: false }
@@ -687,6 +698,7 @@ function prev() {
 
 function setupAudio() {
   audio.volume = 1
+  let audioErrorStreak = 0
   audio.addEventListener('play', () => {
     store.playing = true
     // 本地补丁：谁在出声，谁就持有共享播放权，别的会话收到后自动静音
@@ -700,6 +712,11 @@ function setupAudio() {
   })
   audio.addEventListener('timeupdate', () => {
     store.position = audio.currentTime
+    if (audio.currentTime > 5) {
+      // 这一首真的播起来了：清掉重试标记与连续错误计数
+      audioErrorStreak = 0
+      if (store.track) store.track.retried = false
+    }
     if (Number.isFinite(audio.duration) && audio.duration > 0) store.duration = audio.duration
     store.emit('quiet')
   })
@@ -709,6 +726,30 @@ function setupAudio() {
   })
   audio.addEventListener('error', () => {
     if (!audio.src) return
+    const t = store.track
+    // 直链失效（代理 token 到期等）：清掉缓存重解析一次，还失败才跳下一首
+    if (t && !t.retried) {
+      t.retried = true
+      t.resolved = null
+      t.resolvedAt = 0
+      store.status = '直链已失效，正在重新解析…'
+      store.statusKind = ''
+      store.emit()
+      void playIndex(store.index, { auto: true })
+      return
+    }
+    if (t) { t.retried = false; t.resolved = null; t.resolvedAt = 0; t.failed = true }
+    audioErrorStreak += 1
+    // 整张队列轮一遍都失败就停下，别无限跳过（列表会看起来一直在滚）
+    if (audioErrorStreak >= Math.max(2, store.queue.length)) {
+      audioErrorStreak = 0
+      audio.pause()
+      store.playing = false
+      store.status = '队列里的曲目都无法播放，已停止'
+      store.statusKind = 'err'
+      store.emit()
+      return
+    }
     store.status = '音频加载失败，已跳过'
     store.statusKind = 'err'
     store.emit()
@@ -878,7 +919,9 @@ async function warmQueue(fromIndex = 0) {
     if (token !== drainToken) return
     if (store.pending.length) return // 有新的待解析歌单在跑，让给它
     const t = store.queue[i]
-    if (!t || t.resolved?.url || t.failed) continue
+    if (!t || t.failed) continue
+    // 已有直链且在安全期内才跳过；过期的预热等于没预热
+    if (t.resolved?.url && t.resolvedAt && Date.now() - t.resolvedAt < RESOLVE_TTL_MS) continue
     await resolveTrack(t)
     if (token !== drainToken) return
     store.emit()
