@@ -15,9 +15,16 @@
  * @module dsh-music/client
  */
 
-window.__ModuleLoader__.load({
-  id: 'dsh-music',
-  factory: (require) => {
+/*
+ * 注册 id 必须与宿主图里的包名一致：本插件在 npm 上重命名为
+ * `dsh-music-plugin`（package.json / cordis.patch.yml 都改了）时，client.js
+ * 仍只注册 `dsh-music`，宿主就会报
+ *   client-modules: could not load "dsh-music-plugin": ... loaded without registering
+ * 并让整个 web boot 失败。这里把同一个工厂按两个名字各注册一次，改包名不再炸。
+ * 用 var 而不是 const：combo 批次会把多个 bundle 拼进同一个脚本，顶层 const
+ * 会与其它 bundle 抢全局词法作用域，且 HMR 重新执行时会触发重复声明。
+ */
+var __dshMusicClientFactory = (require) => {
 /**
  * dsh-music 浏览器半区（client half）。
  *
@@ -2041,5 +2048,8 @@ function MusicAccountSection() {
 }
 
     return { apply, inject, name: 'dsh-music' }
-  },
-})
+}
+
+for (var __dshMusicId of ['dsh-music', 'dsh-music-plugin']) {
+  window.__ModuleLoader__.load({ id: __dshMusicId, factory: __dshMusicClientFactory })
+}
