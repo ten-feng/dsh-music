@@ -1,5 +1,5 @@
 {
-  "name": "dsh-music",
+  "name": "dsh-music-plugin",
   "description": "音乐播放器插件：把 ```dsh-music 围栏变成右下角悬浮播放器（魅族16 物理比例 277×569，列表固定展开）。网易云扫码登录、四档音源瀑布（会员 → 免费 → QQ → Meting）、同源音频代理、歌词/封面切换、多主题；浏览器环境可拖到窗口边缘转为独立小窗。",
   "version": "0.3.4",
   "type": "module",
